@@ -1,0 +1,276 @@
+---
+title: "Lecture 2 — Intermediate/Advanced BigQuery for GA4"
+subtitle: "SQL Queries, Explanations, and BigQuery Outputs"
+author: "Pei-Yun Chuang"
+date: "2026-11-08"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    number-sections: true
+execute:
+  eval: false
+---
+
+# Introduction
+
+This notebook documents the ten SQL examples from Lecture 2. SQL blocks are displayed for reference and are not executed by Quarto. The queries were run in Google BigQuery, and screenshots of the results are included below each query.
+
+# CTEs (WITH)
+
+## Q1. CTE: Total users and new users (Nov 2020)
+
+**What this query does:** Counts unique pseudonymous user IDs and identifies new users from first_visit or first_open events in November 2020.
+
+```sql
+WITH UserInfo AS (
+  SELECT user_pseudo_id,
+    MAX(IF(event_name IN ('first_visit', 'first_open'), 1, 0)) AS is_new_user
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201101' AND '20201130'
+  GROUP BY user_pseudo_id
+)
+SELECT COUNT(*) AS total_users, SUM(is_new_user) AS new_users
+FROM UserInfo;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 1](images/query-01.png)
+
+**Result interpretation:** BigQuery returned **79,421 total user IDs** and **71,734 new user IDs** for November 2020. The CTE flags a user as new when at least one first_visit or first_open event is present.
+
+# Arrays + UNNEST
+
+## Q2. Scalar subquery: Extract page_location from page_view events
+
+**What this query does:** Extracts the page_location parameter from page_view events without expanding each event into multiple rows.
+
+```sql
+SELECT TIMESTAMP_MICROS(event_timestamp) AS event_time,
+  (SELECT value.string_value FROM UNNEST(event_params)
+   WHERE key = 'page_location' LIMIT 1) AS page_location
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE event_name = 'page_view'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201202'
+LIMIT 50;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 2](images/query-02.png)
+
+**Result interpretation:** The output displays **50 page-view records** with timestamps and page URLs. The scalar subquery retrieves page_location from event_params without duplicating the original event rows.
+
+## Q3. UNNEST items: Purchase item rows by date and item
+
+**What this query does:** Flattens purchase items to count item rows by event date and product name.
+
+```sql
+SELECT event_date, item.item_name, COUNT(*) AS item_rows
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` AS e,
+UNNEST(e.items) AS item
+WHERE e.event_name = 'purchase'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_date, item.item_name
+ORDER BY item_rows DESC
+LIMIT 20;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 3](images/query-03.png)
+
+**Result interpretation:** The query returned **20 item-date combinations**. The leading visible result was **Gift Card - $25.00** with **28 item rows** on December 1, 2020. Counts represent unnested item rows, not necessarily item quantities.
+
+# STRING_AGG and ARRAY_AGG
+
+## Q4. STRING_AGG: Distinct event names per day
+
+**What this query does:** Combines distinct event names into one comma-separated list for each date.
+
+```sql
+SELECT event_date,
+  STRING_AGG(DISTINCT event_name, ', ' ORDER BY event_name) AS events_seen
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201203'
+GROUP BY event_date
+ORDER BY event_date;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 4](images/query-04.png)
+
+**Result interpretation:** The output contains **three dates**, each with a comma-separated list of distinct event types. STRING_AGG makes the daily event mix easier to review.
+
+## Q5. ARRAY_AGG: Items added to cart by user (not session-level)
+
+**What this query does:** Creates an array of product names added to cart for each user. This example groups by user, not by session.
+
+```sql
+SELECT user_pseudo_id,
+  ARRAY_AGG(item.item_name) AS items_added_to_cart
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+UNNEST(items) AS item
+WHERE event_name = 'add_to_cart'
+  AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY user_pseudo_id
+ORDER BY user_pseudo_id
+LIMIT 10;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 5](images/query-05.png)
+
+**Result interpretation:** The query returned **10 user IDs** with arrays of products added to cart. This shows multiple item names in one record per user rather than a separate row for each item.
+
+## Q6. ARRAY_AGG with STRUCT: Session-level cart summary
+
+**What this query does:** Groups add_to_cart item records by user and GA4 session ID and stores up to ten item records in an array of structs. The count is item rows, not necessarily distinct add_to_cart events.
+
+```sql
+WITH add_to_cart AS (
+  SELECT user_pseudo_id,
+    (SELECT value.int_value FROM UNNEST(event_params)
+     WHERE key = 'ga_session_id') AS session_id,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+    i.item_id, i.item_name, i.quantity, i.price
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`,
+  UNNEST(items) AS i
+  WHERE event_name = 'add_to_cart'
+    AND _TABLE_SUFFIX BETWEEN '20210101' AND '20211231'
+)
+SELECT user_pseudo_id, session_id,
+  COUNT(*) AS total_add_to_cart_events,
+  ARRAY_AGG(STRUCT(item_id, item_name, quantity, price, event_timestamp)
+    ORDER BY quantity DESC, event_timestamp ASC LIMIT 10) AS cart_items
+FROM add_to_cart
+WHERE session_id IS NOT NULL
+GROUP BY user_pseudo_id, session_id;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 6](images/query-06.png)
+
+**Result interpretation:** The output shows **4,537 session-level records**. Each record groups added-to-cart items within a user and session, with up to 10 item structures ordered by quantity and event time. The count reflects item rows, despite the output column name total_add_to_cart_events.
+
+# Joins
+
+## Q7. LEFT JOIN: Daily users and transaction counts
+
+**What this query does:** Uses a LEFT JOIN to keep every day with users and attach daily distinct transaction counts. The displayed percentage is transactions per user, not a true user purchase conversion rate.
+
+```sql
+WITH daily_users AS (
+  SELECT event_date, COUNT(DISTINCT user_pseudo_id) AS users
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+),
+daily_purchases AS (
+  SELECT event_date,
+    COUNT(DISTINCT (SELECT value.string_value FROM UNNEST(event_params)
+      WHERE key = 'transaction_id')) AS purchases
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE event_name = 'purchase'
+    AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY event_date
+)
+SELECT u.event_date, u.users, IFNULL(p.purchases, 0) AS purchases,
+  ROUND(IFNULL(p.purchases, 0) / NULLIF(u.users, 0) * 100, 2)
+    AS conversion_rate_pct
+FROM daily_users AS u
+LEFT JOIN daily_purchases AS p ON u.event_date = p.event_date
+ORDER BY u.event_date;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 7](images/query-07.png)
+
+**Result interpretation:** The output contains **31 daily rows**. On December 1, 2020, the report shows **4,308 users**, **96 distinct transactions**, and a **2.23% transaction-to-user ratio**. This ratio is not the same as the share of users who purchased.
+
+# Window functions + QUALIFY
+
+## Q8. RANK and QUALIFY: Top 3 event types per day (ties may add rows)
+
+**What this query does:** Ranks event types by their daily counts and retains ranks 1 through 3. Ties may produce more than three rows per day.
+
+```sql
+WITH daily_event_counts AS (
+  SELECT event_date, event_name, COUNT(*) AS events
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201207'
+  GROUP BY event_date, event_name
+)
+SELECT event_date, event_name, events,
+  RANK() OVER (PARTITION BY event_date ORDER BY events DESC) AS rnk
+FROM daily_event_counts
+QUALIFY rnk <= 3
+ORDER BY event_date, rnk;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 8](images/query-08.png)
+
+**Result interpretation:** The query returned **21 rows** for seven days. For December 1, page_view ranked first with **21,511 events**, user_engagement second with **19,069**, and scroll third with **8,629**.
+
+## Q9. Window: Rolling 7-row average of daily purchases
+
+**What this query does:** Computes a moving average over the current and six preceding rows of days with purchases; dates with zero purchases are not explicitly filled.
+
+```sql
+WITH daily_purchases AS (
+  SELECT PARSE_DATE('%Y%m%d', event_date) AS dt,
+    COUNT(*) AS purchases
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE event_name = 'purchase'
+    AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+  GROUP BY dt
+)
+SELECT dt, purchases,
+  AVG(purchases) OVER (
+    ORDER BY dt ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS purchases_7d_avg
+FROM daily_purchases
+ORDER BY dt;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 9](images/query-09.png)
+
+**Result interpretation:** The output contains **31 dates**. December 1 shows **107 purchase events** and a rolling average of **107.0**; December 2 shows **82 purchase events** and an average of **94.5**. At the start of the series, the average uses fewer than seven available days.
+
+# Approximate functions
+
+## Q10. Approximate distinct users by event type
+
+**What this query does:** Estimates the number of distinct pseudonymous users for each event type, returning the top fifteen types.
+
+```sql
+SELECT event_name,
+  APPROX_COUNT_DISTINCT(user_pseudo_id) AS approx_users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
+GROUP BY event_name
+ORDER BY approx_users DESC
+LIMIT 15;
+```
+
+**BigQuery output screenshot:**
+
+![BigQuery output for Query 10](images/query-10.png)
+
+**Result interpretation:** The output lists **15 event types** ranked by approximate distinct users. The leading visible values are **page_view (104,837)**, **session_start (104,243)**, and **first_visit (97,528)**. These are estimates rather than exact distinct counts.
+
+# Appendix
+
+- **GitHub Repository:** [Insert your GitHub repository URL after publishing](https://github.com/)
+- **GitHub Pages:** [Insert your GitHub Pages URL after publishing](https://pages.github.com/)
+
+*Source note:* SQL code is based on the submitted Lecture 2 SQL file. Screenshots document the BigQuery results supplied for this assignment. The GitHub links above must be replaced with the actual published URLs.
